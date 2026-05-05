@@ -167,52 +167,77 @@ ALERT_GAIN = 1.0                        # 알림음 볼륨
 
 ### 데이터 흐름
 
-```
-마이크 입력
-   ↓
-[모노 변환]
-   ↓
-[Highpass Filter] ── 100Hz 이하 컷
-   ↓
-[Lowpass Filter] ─── 1200Hz 이상 컷
-   ↓
-[Compressor] ─────── 다이내믹 평탄화 (4:1)
-   ↓
-[Distortion] ─────── 18dB 드라이브
-   ↓
-[Gain] ────────────── 클리핑 방지
-   ↓
-[Noise Mixing] ────── 음성 활동에 따라 0~1.0 스케일링
-   ↓
-가상 오디오 케이블 출력
+마이크 입력이 필터 체인을 거친 뒤, 알림음 재생 여부에 따라 두 갈래로 나뉘어 가상 케이블로 출력됩니다.
+
+```mermaid
+flowchart TD
+    A[마이크 입력] --> B[모노 변환]
+    B --> C["Highpass Filter<br/>100Hz 이하 컷"]
+    C --> D["Lowpass Filter<br/>1200Hz 이상 컷"]
+    D --> E["Compressor<br/>4:1 압축"]
+    E --> F["Distortion<br/>18dB 드라이브"]
+    F --> G["Output Gain<br/>−3dB"]
+    G --> H{알림음 재생 중?}
+    H -->|Yes| I["알림음 믹스<br/>노이즈 차단"]
+    H -->|No| J["덕킹된 노이즈 추가<br/>(음성 활동에 따라)"]
+    I --> K[가상 오디오 케이블]
+    J --> K
 ```
 
 ### 노이즈 덕킹 상태 머신
 
-```
-        ┌─── 음성 감지 ───┐
-        ↓                ↑
-    [차단 (0)]        [홀드 (0)]
-        │                ↑
-        └─ 음성 끝 ──────┘
-                         │ 300ms 경과
-                         ↓
-                   [릴리스 페이드]
-                         │ 150ms 경과
-                         ↓
-                  [정상 (1.0)]
-                         │
-                         └─ 음성 감지되면 위로 ─┐
-                                              ↑
+음성 감지 시 즉시 노이즈를 차단하고, 홀드 → 릴리스 페이드를 거쳐 다시 정상 상태로 복귀합니다.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle: 정상 (게인 1.0)
+    Ducked: 차단 (게인 0.0)
+    Hold: 홀드 (게인 0.0)
+    Release: 릴리스 (게인 0→1.0 페이드)
+
+    Idle --> Ducked: 음성 감지
+    Ducked --> Ducked: 음성 지속
+    Ducked --> Hold: 음성 종료
+    Hold --> Ducked: 음성 재감지
+    Hold --> Release: 300ms 경과
+    Release --> Ducked: 음성 재감지
+    Release --> Idle: 150ms 경과
 ```
 
-### 키보드 트리거
+### 키보드 트리거 (lock-free 스레드 통신)
 
-- pynput 라이브러리로 글로벌 키보드 리스너를 백그라운드 스레드에서 실행
-- 키 입력 시 lock-free 플래그(`_trigger_pending`)만 set
-- 오디오 콜백이 매 블록마다 플래그를 check & consume
-- 트리거 발견 시 알림음 position을 0으로 리셋해 처음부터 재생
-- 락을 쓰지 않아 실시간 오디오 스레드의 지연 위험 없음
+키보드 리스너 스레드와 오디오 콜백 스레드가 단일 boolean 플래그로만 통신합니다. 락을 쓰지 않아 실시간 오디오 스레드 블로킹 위험이 없습니다.
+
+```mermaid
+sequenceDiagram
+    actor User as 사용자
+    participant Kb as 키보드 리스너 스레드
+    participant Flag as _trigger_pending<br/>(공유 boolean)
+    participant Audio as 오디오 콜백 스레드<br/>(실시간 우선순위)
+    participant Out as 가상 오디오 케이블
+
+    User->>Kb: ` 키 누름
+    Kb->>Flag: True 세팅
+
+    Note over Audio: 매 블록(~10ms)마다 호출
+    Audio->>Flag: 플래그 체크
+    Flag-->>Audio: True
+    Audio->>Flag: False로 리셋
+    Audio->>Audio: position = 0
+
+    loop 1초간 (알림음 길이)
+        Audio->>Out: 알림음 청크 + 마이크 음성<br/>(노이즈 차단 상태)
+    end
+
+    Audio->>Audio: position = -1
+    Note over Audio: 노이즈 다시 활성화
+```
+
+특징:
+- pynput이 글로벌 키보드 이벤트를 백그라운드 데몬 스레드에서 수신
+- 빠르게 두 번 누르면 두 번째 트리거가 첫 번째 재생을 끊고 처음부터 재생 (옵션 A 동작)
+- 단방향 set/consume 패턴 — 키보드 스레드는 set만, 오디오 스레드는 read+reset만 수행
 
 ## 트러블슈팅
 
